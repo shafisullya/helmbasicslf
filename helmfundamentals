@@ -1,0 +1,635 @@
+﻿
+Throughout this course, we have seen how Helm can be used as a powerful tool to manage applications on Kubernetes. Helm also has a number of other optional features which serve to further enhance this experience.
+
+In this chapter, we will discuss some of Helm’s more advanced features which you may wish to integrate into your Helm-based workflow.
+
+We will explain how to leverage starters, which allow you to use a predefined base chart to use for helm create. We will go over the concept of library charts, non-installable charts which can provide common helpers. We will explore Helm plugins, and how they are used to extend the Helm CLI. We will also talk about provenance files, and how to properly sign and verify chart packages.
+
+This chapter also contains an in-depth lab to explore the internals of chart repositories, how Helm interacts with them, and how to host your own repository. Lastly, we will briefly talk about Helm’s experimental OCI support, a new, alternative approach to chart distribution which leverages the same APIs used for container registries.
+
+
+
+By the end of the section, you should be able to:
+
+Use starters to customize the creation of new charts.
+Build library charts to share common helpers.
+Understand how Helm plugins extend the Helm CLI.
+Sign and verify chart packages using provenance files.
+Host and maintain your own chart repository.
+
+Specifying a Custom Starter Pack
+Throughout this course, we have used the helm create command to generate charts to use for example purposes. This command creates a brand new chart based on Helm’s best practices and hardcoded boilerplate templates.
+
+If you find that you are often creating new charts from scratch, you can customize this functionality by using what’s known as a starter, or starter pack. Starters allow you to define a unique baseline for new charts, and streamline the process of creating charts for similar applications.
+
+For example, you might find that all of the charts that you use for stateless web services share the same three templates: deployment.yaml, ingress.yaml, and service.yaml. You can create a starter pack which contains just these 3 templates, so that the next time you go to run “helm create” for a new stateless web service, the resulting chart will require less customizations.
+
+Build a chart you wish to use for the stateless starter pack. Here’s an example of the structure for this chart:
+
+stateless/
+├── Chart.yaml
+├── templates
+│   ├── _helpers.tpl
+│   ├── deployment.yaml
+│   ├── ingress.yaml
+│   └── service.yaml
+└── values.yaml
+
+Starter charts should look like any other other chart, with the exception that you should replace all occurrences of the chart name with the hardcoded string <CHARTNAME>. Here’s an example snippet from the deployment.yaml template:
+
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "<CHARTNAME>.fullname" . }}
+  labels:
+    {{- include "<CHARTNAME>.labels" . | nindent 4 }}
+...
+
+Once you are happy with your starter chart, you must make sure it is present in the $XDG_DATA_HOME/helm/starters directory (on Linux, the default for XDG_DATA_HOME is $HOME/.local/share). Copy your chart manually into the proper location (making sure the starters directory exists first):
+
+$ mkdir -p $HOME/.local/share/helm/starters
+$ cp -r stateless $HOME/.local/share/helm/starters
+
+Finally, to generate a new chart using your starter, use the --starter flag on helm create:
+
+$ helm create --starter stateless mychart
+
+Creating mychart
+
+The newly-generated chart should be in essence a clone of the starter chart:
+
+$ ls mychart/templates/
+
+_helpers.tpl  deployment.yaml  ingress.yaml  service.yaml
+
+Starters enhance Helm-based workflows by allowing you to build upon chart patterns that you have previously developed and found useful. Overall, they reduce the time it takes to build new Helm charts for applications with similar requirements.
+
+
+
+
+Creating a Library Chart
+Library charts are special types of Helm charts which contain definitions to be used in other charts. You can use library charts, for example, to create new functions to use in your chart templates.
+
+Unlike typical charts, library charts are not installable:
+
+$ helm install demo mylib/
+
+Error: library charts are not installable
+
+In order to denote a chart as a library chart, set the type field in Chart.yaml to library. Here’s an example of a Chart.yaml for a library chart:
+
+name: mylib
+version: 0.1.0
+apiVersion: v2
+type: library
+
+Another notable difference is that library charts do not contain a values.yaml file or any real templates. Instead, library charts contain .yaml or .tpl files under the templates/ directory prefixed with an underscore (_). Files starting with an underscore (_) inside the templates/ directory are not expected to produce any Kubernetes manifests.
+
+Here’s the structure of a simple, example library chart called mylib:
+
+mylib/
+├── Chart.yaml
+└── templates
+    └── _utils.tpl
+
+The file templates/_utils.tpl will be used to define utility helpers for us to use in other charts. For the sake of example, we will just define a single helper in this file, companyLabels, which returns labels that should be present on all Kubernetes resources owned by your company.
+
+Here are the contents of templates/_utils.tpl:
+
+{{- define "mylib.companyLabels" -}}
+builtByCompany: "true"
+{{- end }}
+
+By using this helper in other charts, system administrators will be able to, for example, query for Kubernetes cluster resources built by the company.
+
+
+Using a Library Chart as a Dependency
+Now that we have a library chart to work with (mylib), we need to first list it as a dependency in order to use it.
+
+Let’s consider this library chart has been published to a chart repository located at http://localhost:8000 (see the lab in this chapter for how to host a chart repository).
+
+In a new chart, we can list this dependency under the dependencies section in Chart.yaml. Here is the Chart.yaml for a new chart, mychart, which will leverage the mylib library chart:
+
+name: mychart
+version: 1.0.0
+apiVersion: v2
+type: application
+dependencies:
+- name: mylib
+  version: 0.1.0
+  repository: http://localhost:8000
+
+Notice also that for this chart, the type field is set to application, denoting this as a normal, installable chart.
+
+Here is the structure of the mychart chart:
+
+mychart/
+├── Chart.yaml
+├── templates
+│   ├── _helpers.tpl
+│   └── configmap.yaml
+└── values.yaml
+
+This chart contains a single template, configmap.yaml, which defines a simple Kubernetes configmap. In this template, we will leverage the companyLabels helper defined in the library chart.
+
+Here are the contents of templates/configmap.yaml:
+
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "mychart.fullname" . }}
+  labels:
+    {{- include "mylib.companyLabels" . | nindent 4 }}
+    {{- include "mychart.labels" . | nindent 4 }}
+data:
+  mykey: {{ .Values.myval | quote }}
+
+Cont'd on the next page.
+
+
+Using a Library Chart as a Dependency (Cont.)
+Now to use this chart, we must first obtain the mylib dependency. To do this, we use the helm dependency update command:
+
+$ helm dependency update mychart/
+
+Saving 1 charts
+Downloading mylib from repo http://localhost:8000
+Deleting outdated charts
+
+The mylib library chart tarball was fetched from the remote repository and placed into the charts/ subdirectory. Additionally, a Chart.lock file was created, which contains information about the downloaded dependencies.
+
+Here is the new structure of our chart after running helm dependency update:
+
+mychart/
+├── Chart.lock
+├── Chart.yaml
+├── charts
+│   └── mylib-0.1.0.tgz
+├── templates
+│   ├── _helpers.tpl
+│   └── configmap.yaml
+└── values.yaml
+
+The contents of Chart.lock will look like the following:
+
+dependencies:
+- name: mylib
+  repository: http://localhost:8000
+  version: 0.1.0
+digest: sha256:5c1e94a904487106e9a05661f59badd030d87d5c4369046250d5868052e6dcf1
+generated: "2020-07-02T00:49:18.313929822Z"
+
+Now that we have gathered our dependencies (mylib), we can install our chart:
+
+$ helm install mychart-demo mychart/
+
+NAME: mychart-demo
+LAST DEPLOYED: Thu Jun 2 00:56:27 2020
+NAMESPACE: default
+STATUS: deployed
+REVISION: 1
+TEST SUITE: None
+
+Then, if we inspect the created configmap, we should see our builtByCompany label being properly set to true:
+
+$ kubectl get configmap mychart-demo --label-columns=builtByCompany
+
+NAME           DATA   AGE     BUILTBYCOMPANY
+mychart-demo   1      2m47s   true
+
+By using library charts, we are able to take the repeated parts of Helm charts and package them into reusable units that can be imported and used in other charts.]]]
+
+
+Using Plugins to Extend the Helm CLI
+You may find that you want to add extra features to Helm, such as a command to publish chart packages to a chart repository, or a command to fetch and store secrets. Since Helm is an open-source project, of course you could submit a pull request against the codebase and hope that your change gets merged and becomes part of the stable codebase.
+
+However, the Helm project receives lots of requests for new features. So not only will it take time to get your change merged, but there’s a chance that it might never get approved. The Helm CLI works well in part due to all of the things the project maintainers have said “no” to. As a general philosophy, good tools should do one thing well vs. doing everything.
+
+Luckily, there is an alternative available for extending the Helm CLI—plugins. Helm plugins add extra subcommands to the Helm CLI, seamlessly integrating with the rest of the Helm user experience.
+
+Installing and Removing Plugins
+First, determine the plugin you wish to install. The “helm-plugin” topic on GitHub is a good way to find lots of useful, publicly-available Helm plugins.
+
+For this example, we will use the “starter” plugin. This is a simple plugin which adds better management for Helm starters.
+
+To install the plugin, run helm plugin install, pointing to a public git URL:
+
+$ helm plugin install htt‌ps://github.com/salesforce/helm-starter.git
+
+Installed plugin: starter
+
+Once it’s installed, you’ll notice that the Helm CLI has now an additional starter subcommand that wasn’t there previously:
+
+$ helm starter --help
+
+Fetch, list, and delete helm starters from github.
+
+Available Commands:
+    helm starter fetch GITURL       Install a bare Helm starter from Github (e.g git clone)
+    helm starter list               List installed Helm starters
+    helm starter delete NAME        Delete an installed Helm starter
+    --help                          Display this text
+
+Use helm plugin list to show all installed plugins:
+
+$ helm plugin list
+
+NAME       VERSION     DESCRIPTION
+starter    1.0.0       This plugin fetches, lists, and deletes helm starters from github.
+
+If you wish to remove an installed plugin, use helm plugin remove:
+
+$ helm plugin remove starter
+
+Uninstalled plugin: starter
+
+
+How to Build Your Own Plugin
+Building your own plugin is fairly straightforward. It does not require any knowledge of Go, or any specific programming language.
+
+Let’s build an example plugin called “hello”, that simply greets the terminal user.
+
+Each plugin is defined in a manifest file with the name plugin.yaml. This file contains the name of the plugin, as well as the command to execute when the plugin is run.
+
+Here is the plugin.yaml for our “hello” plugin:
+
+name: hello
+version: 1.0.0
+description: just a friendly greeting
+command: "echo hello ${USER}"
+
+In development, you can run helm plugin install pointing to a local directory, and Helm will create an internal symlink and register this plugin:
+
+$ pwd
+
+/home/myuser/helm-hello
+
+$ ls
+
+plugin.yaml
+
+$ helm plugin install .
+
+Installed plugin: hello
+
+$ ls -la /home/myuser/.local/share/helm/plugins/
+
+total 8
+drwxrwxr-x 2 myuser myuser 4096 Jul 2 10:21 .
+drwxrwxr-x 4 myuser myuser 4096 Jul 1 21:38 ..
+lrwxrwxrwx 1 myuser myuser   26 Jul 2 10:21 helm-hello -> /home/myuser/helm-hello
+
+$ helm plugin list
+
+NAME  VERSION   DESCRIPTION
+hello 1.0.0     just a friendly greeting
+
+Now you can try out your plugin:
+
+$ helm hello
+
+hello myuser
+
+This is a very simple example, but serves to show how customizable Helm plugins are.
+
+Cont'd on the next page.
+
+
+How to Build Your Own Plugin (Cont.)
+You can use whatever you want for the command field in plugin.yaml, including a custom script or tool. For example, let’s say if you have a Bash script called hello.sh:
+
+#!/bin/bash -e
+echo "hello ${USER}"
+
+You could rewrite your plugin.yaml to be the following:
+
+name: hello
+version: 1.0.0
+description: just a friendly greeting
+command: "${HELM_PLUGIN_DIR}/hello.sh"
+
+Note: The variable HELM_PLUGIN_DIR refers to the directory containing all the files obtained from the Git repository when it was installed. To learn more about additional environment variables see "The Helm Plugins Guide".
+
+In some instances, you might need to fetch additional files in order for the plugin to be installed properly. For example, you may need to obtain a Go binary for Linux vs. Mac vs. Windows. If necessary, you can add a hooks section to your plugin.yaml that contains an extra command to run upon installation:
+
+name: hello
+version: 1.0.0
+description: just a friendly greeting
+command: "${HELM_PLUGIN_DIR}/bin/hello"
+hooks:
+  install: "${HELM_PLUGIN_DIR}/scripts/download-the-correct-binary.sh"
+
+In the example above, the plugin’s git repo contains a script located at scripts/download-the-correct-binary.sh which is run at install time, which is responsible for dynamically creating the file bin/hello based on the operating system.
+
+Plugins offer an easy way to extend the Helm CLI to meet special requirements without having to make any modifications to the Helm codebase.
+
+
+Signing Your Chart Packages
+When you download a chart package from a chart repository, how do you ensure that the chart package has not been compromised in some way? By compromised, we mean some system error occurred which replaced the chart, or in a worse case scenario: a bad actor has replaced it with a malicious chart.
+
+Malicious charts might look nearly identical to the original, with a modified values.yaml to point to a malicious container image. For example, instead of a snippet like this in values.yaml:
+
+image:
+  repo: r.mysite.io
+  tag: 1.2.3
+
+You might instead see something like the following:
+
+image:
+  repo: r.mysiteio.ninja
+  tag: 1.2.3
+
+The container image r.mysiteio.ninja:1.2.3 may contain a modified version of your application that periodically sends system information to some remote server controlled by the bad actor. Scary stuff!
+
+This situation can be prevented by signing your chart packages and generating what are known as provenance files. Provenance files contain both the checksum of the package to verify the package contents, as well as a cryptographic signature to identify the person or entity that originally created the package.
+
+In order to generate provenance files, you must first have GNU Privacy Guard (GPG) installed.
+
+Next you must have an existing keypair to use. To generate a new one, use the following command:
+
+$ gpg --full-generate-key
+
+When prompted for a selection for the type of key, just click Enter to use the default (“RSA and RSA”). When prompted for a key size, type out “4096” (the max size). When asked how long the key should be valid for, just click Enter to use the default (“key does not expire”), and enter “y” to verify if necessary. When asked for your real name and email, provide them. For comment, just click Enter to leave blank. When asked to verify the information, type “O” for Okay and click Enter. Finally, when prompted, enter a secure passphrase (at least 8 characters). You will need to remember this for each time you use this keypair. Click Enter, re-enter the passphrase when prompted, and click Enter one last time to finally generate the keypair.
+
+Use the following command to list all of your keypairs:
+
+$ gpg --list-secret-keys --keyid-format LONG
+
+gpg: checking the trustdb
+gpg: marginals needed: 3 completes needed: 1  trust model: pgp
+gpg: depth: 0  valid:   1 signed:   0  trust: 0-, 0q, 0n, 0m, 0f, 1u
+/home/myuser/.gnupg/pubring.kbx
+----------------------------------
+sec   rsa4096/0A9B240B669698D4 2020-07-02 [SC]
+      796633B593CDA8B24F838B0E0A9B240B669698D4
+uid                 [ultimate] Jane Doe <jane.doe@mail.co>
+ssb   rsa4096/6E347211B20E0A1F 2020-07-02 [E]
+
+Cont'd on the next page.
+
+Signing Your Chart Packages (Cont.)
+As a final step, convert the keyring to the legacy format. Provide your passphrase when requested:
+
+$ gpg --export-secret-keys > "${HOME}/.gnupg/mykeyring.gpg"
+
+Now you are ready to start signing chart packages.
+
+Let’s create a sample chart, mychart:
+
+$ helm create mychart
+
+Creating mychart
+
+Finally, generate the provenance file by adding the --sign, --key, and --keyring options when using helm package, referencing the email you entered previously and path to the keyring. Provide your passphrase when requested:
+
+$ helm package --sign --key jane.doe@mail.co --keyring \
+"${HOME}/.gnupg/mykeyring.gpg" mychart/
+
+Password for key "Jane Doe <jane.doe@mail.co>" >
+Successfully packaged chart and saved it to: /home/myuser/mychart-0.1.0.tgz
+
+You’ll notice that sitting beside the newly created chart package, mychart-0.1.0.tgz, is a file with the name mychart-0.1.0.tgz.prov (package filename with .prov extension appended). This is the provenance file.
+
+If we inspect this file, we will see it contains a checksum for the tarball, as well as a PGP signature:
+
+-----BEGIN PGP SIGNED MESSAGE-----
+Hash: SHA512
+
+apiVersion: v2
+appVersion: 1.16.0
+description: A Helm chart for Kubernetes
+name: mychart
+type: application
+version: 0.1.0
+
+...
+files:
+  mychart-0.1.0.tgz:
+sha256:fcf948c63332a66494feeda10780c3f586eb94e550c4aa61323965762fb992ff
+-----BEGIN PGP SIGNATURE-----
+
+wsFcBAEBCgAQBQJe/ZTKCRBv9NNfRdCBpQAAtwIQAKBgiqIgxPhhcql/Lxbsty/e
+BhDhtXoLqd7Rx83qX7HMVtikkDD5yy9A9n7vzNqaWjQO438m1u0QYdK5w8wf3Jq6
+L+FSMQBa1XRS8Dk7bePreZZQuatluLtDBf0x+5qhiK5wgzuJL56/tbaFqeezkkfA
+lfl3D55w4MfEBw7+h32vXcPB59pscgDk6CxOarcGZWrs8NkM8Lig3RqS+6lSaKpI
+w8kCufpKnvzs3Fk48f/+Nc7kuHCSckIiUkaotXMzruvhF6crwTIGRzi79zbpezxg
+Pm9T4LAH0eZOuBWANhd3/MpuO25rTl+RAsAWKsF3N7CzIUBWp/Tfgel05sCMIMyR
+GBEsFFMiFv4P4NbdczDmEsHSSyafrQuU3bTnV85iDn8rdTimYu4/15L+bxehOpVO
+zBkYl83k0C3kP3JvfxdPPwTQ9J7JxnE1gYX66uFTTbEWjArYMuTsqr0sV1jcBlYz
+0+tK31p3UP51Me9Fea4p7rRCqvcy2za4meKie1kRenkszH2uVYkz6MNUCp8Qt1Av
+nyuU8iM8ycRiDVJUIVcRaU9AvxCe9KhiKJJ8Ii6V0FTgGWmrcZ0fcGzCpBhywW/s
+N7uYQ7PAhAowoBD7hpI79n5Pkvpx6EWOiNrYKwZbzM/FtiGMV8Z9YSFYjYYXRHLT
+USAn041xbsH+nOlRI+kl
+=xdnn
+-----END PGP SIGNATURE-----
+
+
+Verifying Chart Package Signatures
+In a typical scenario, the public key associated with the private key used to generate a provenance file is made public somewhere on the internet. This file is then used to validate a chart package signature.
+
+To generate a public key from your keyring created in the previous section, run the following command:
+
+$ gpg --armor --export jane.doe@mail.co > mykey.pub
+
+The contents of this file can be made public to whomever need to verify your chart packages:
+
+$ cat mykey.pub
+-----BEGIN PGP PUBLIC KEY BLOCK-----
+
+mQINBF79lAYBEADFBly6J9WvxoaMUX+9PH6cD24YWdhErNedINDtwPROL/HV44Tg
+EZGtyP9D64mvVnntcoRRP8jgE8VDbDc0yuVMiOwBWqMa/KrYWDehl1vTb1kWL2Sx
+ZqgyImgPX0nLxbPB2WjjIapcC4aKl9GP1utDbM8z+w7PzSHlFaOMZVjwpO3TuVVt
++hZ1z2jAnwANwqzyFCGSpbc17x2iwidPmTrCe+zI6fL+6V0rCHxEVL6SNcvaZJuf
+Aysdb3tV8D9LQkqVxDFUDJusk7M2IsmzZ1T1QpVcqrOa68R/eBmvnZ1n0hoimgY8
+I5sLIa27fc7YepEymE8hOtwFMc8WVMVzJU5giqkwJ93KtLltCn/9F5bkomvCl5Ow
+h0ZPdqL9n6OJsqYlAWtrpFqGOHTny5rM8QnES5BJU2fREwbNDKo1XmgRdvPcFgV4
+DmIKEn1u0j1KQMJ9BkHs42Pi2sFDT1HBxAYiOF3qz0l/AQwhU1vc7V00VzcFAB2H
+bbbPKxInj2I97j37YSGMdb6yM9xqqSYcKnQ5EP8hyHQIGu6WvZgW6HV54pg4PA2F
+K+0OcW7uDCZjJWZKbnqs5hbKTQ8Dq6Cq27HxkMV5omoM3lvr7NoU1JuHjTdBugwf
+4EhvpiDZsUOtjqKGVEvGYVMsnWNUOsspTyZgRvvckwPcTjqniY1DTiIpiwARAQAB
+tBtKYW5lIERvZSA8amFuZS5kb2VAbWFpbC5jbz6JAk4EEwEKADgWIQTRJihbPfcz
+ce/4QEhv9NNfRdCBpQUCXv2UBgIbAwULCQgHAgYVCgkICwIEFgIDAQIeAQIXgAAK
+CRBv9NNfRdCBpSYuD/9Ajq1ZQW6rpRJHPbr5URrIfhRDu4G3bnWFlwPW7UjOWLuS
+3zSjVcUiJEVG6Fau7iXMt9hIsrzsmm1LsTvjqe7sTNrI0cbEn9HzjSEigWwJuK5W
+fDFr5eE3rj6gSyCTxF2VLHFLDMZTIfB1JEaOzNV/9EKvCOTk2rP8Spc9g4Bkv7kH
+quamUPBPFwNPxEpb6UWXIc2SD9b9oUgdbHCRCbzQMS4Lep+zlebQPxS+NV7BjSVM
+a6ogyNcM2ds47dpRwuZEINuW12CJTof/pcgZaIelgR3jfq8YcshLWHJS57Ao0iSH
+qGL5o4iP+GMfG6twPsa/bgcd0VfZfEzx0dDYhaM9kPOwB+fFSF594u3FdENHQuNY
+Du+bgoQqAq0KgjD+6OKS5ydK9Fne7SWxrdJl/+Hc7sMoOtLD99Nc0tPaxsOiJd/9
+tYmvAZt97ToLgPtahDNfZD8fheRXPPbcszCRxEZDiv1R3di4lCRZdJNHaGUkzKJx
+P9VAIdHH+2h9UyU1fwb+J0BCAXmBlxTJSiWAh2Pd/xpJn0KELFH7N9mx7cRXyq4V
+6mIsFmRGdjRuft6AO/KGMBCUJt7Ir7UwggLOji6oURQZMow3wPnzgPGdrMJbLCE1
+qKAC+gOZTtudgkCNG1khn5NcMIjnPyU5OkBDWZm4fghA4V4P/MlNVKi76CHqwrkC
+DQRe/ZQGARAAssiGToc8YfpBMLA+Qml2rFj5en79O4i3rxCum8yQDzBN4e9hWbYm
+l2oX+0eRafw25TNUIF/KfZwf14UXlKQRTXer4Ebmf8kF7NpDVM9EVewgiujklzUd
+YNjhn1rFu9YFGWs1b9AuOZE9plrhkU9ArOxcN5iFBYsGDBnWiHdJYVSKWShI7+H1
+xlIF+7W4CbQx6tini0JUWKLC6ykQ+EIw1Lm6KzRbTydx15QCQs6ZC9KNQzMExBQJ
+0kYiYWyoaaVGiVPw7D7yQt6m6kVBd49XRhufBzh4MX/OLtTFAShNRG15Qh3f4uGW
+Zkvj6UjEjJSyguiD2vVBFtykIwfJ1fdKRTTN1ALRY638a+SiaroAUsnw0+KT0Zsw
+W2uuf9VGcM1o2ftl9BAu88qCpHXz/z45pbGt1gbix59W4Mi1wqzmZctlrBjP1p1l
+Nd9Eah3VIBAw5Gkq1y/PrHRCwW3A6yfQTsYL7oiF7EMDJIxrgNRm6H59FfLvAHtL
+03TuDB/kPX2Ue1+PeF6KeV8DvjW+p5TF9UVIxh0KVcrL0zv1GX4HfOIjJ9O8w7Ng
+yHr+zZfIbt6/YNWEp0qFyTH+jwy3Z6iThQUQbZjNzYxcYpo44vaF5gOgc7oa6CDB
+h4t5jls+2Uo6O8Q1El9mrH34LH0ZX4vkr1Q+CAsOZ4LZqox9DsQ276cAEQEAAYkC
+NgQYAQoAIBYhBNEmKFs99zNx7/hASG/0019F0IGlBQJe/ZQGAhsMAAoJEG/0019F
+0IGlDlcP/iFAlkkNQGUXtbDHoYMhuFty/EHDpXhJwmGB2O1sTddVuHKk6X18F2iE
+psxKYjdyL47S6lc1widuTXRbQjgDsppJF8BPhodecon7twyFiC1+qLt1J8pbASgZ
+Ju66Lcyr6O8LmxNShhKYdn4/WNq1s4GiOcPS9DP5sMFnPC0oCcIuLH861z3nYKqz
+/ZAmy7nJEOy6To8gonRE7CC5gdoZ3njSraHhC6mjfm5bOBJ1UBFhxAo/DGs7wbBr
+YHdfvJciHrDNQ6EzkJ9WiBJGhA3oBE4p/wxTA9JCyR5KJn2ZpPlBtLQG3LrO8OuI
+DP2DwgE5y+ovfO1VpmNSftQvbBiGzLpLw9g5eqTX+H8Eo0EKaQWDHH5SM/6Lzssx
+YCbbLzhFUvqrfqd9OAzH0UG6lKJiwefzgR86lajVId5XuUrHtKrCaBR6TsuaGyRE
+PfTtZlCN8BsctB7lR1PKpiSK/5ggX9gZsGd5HifG28bjrZ2nuaya0VgzOweRMaFe
+Q12OCmeIeERinyFkAaQI3KdSCKyiRGzJqmALKP4RrmxsE549mjgmJEY3GQRIdjSR
+4JzUsazkKxUOmtLqNyo385I6DyLTIwptzp6FzPjB//xyND5/y7bsx7bIedjO4QbJ
+gPOMISnPeLAExr0Yvrn+Cc3GCcbio8/sGkB1HVy3GJiQ7SJiWXQu
+=amcc
+-----END PGP PUBLIC KEY BLOCK-----
+
+Another user who wishes to verify your chart packages must then import this key into their keyring:
+
+$ gpg --import mykey.pub
+
+gpg: key 6FF4D35F45D081A5: public key "Jane Doe <jane.doe@mail.co>" imported
+gpg: Total number processed: 1
+gpg:               imported: 1
+
+Cont'd on the next page.
+
+
+Verifying Chart Package Signatures (Cont.)
+Once again, make a legacy version of the keyring containing your imported public keys:
+
+$ gpg --export > "${HOME}/.gnupg/mypubkeyring.gpg"
+
+Consider the files mychart-0.1.0.tgz and mychart-0.1.0.tgz.prov from the previous section are available in a chart repository located at http://localhost:8000. Add this repository to the local list of repositories:
+
+$ helm repo add myrepo http://localhost:8000
+
+Now, when you proceed to install your chart from this repo, add the --verify and --keyring flags which will cause Helm to fetch the .prov file and verify the package checksum and signature:
+
+$ helm install --verify --keyring "${HOME}/.gnupg/mypubkeyring.gpg" prov-demo myrepo/mychart
+
+NAME: prov-demo
+LAST DEPLOYED: Thu Jun 2 08:34:43 2020
+NAMESPACE: default
+STATUS: deployed
+REVISION: 1
+NOTES:
+1. Get the application URL by running these commands:
+  export POD_NAME=$(kubectl get pods --namespace default -l "app.kubernetes.io/name=mychart,app.kubernetes.io/instance=prov-demo"
+-o jsonpath="{.items[0].metadata.name}")
+  echo "Visit http://127.0.0.1:8080 to use your application"
+  kubectl --namespace default port-forward $POD_NAME 8080:80
+
+If the checksum of the chart package does not match that specified, you will be met with an error (add the --debug flag):
+
+$ helm install --debug --verify --keyring "${HOME}/.gnupg/mypubkeyring.gpg" prov-demo myrepo/mychart
+
+install.go:159: [debug] Original chart version: ""
+Error: sha256 sum does not match for mychart-0.1.0.tgz: "sha256:fcf948c63332a66494feeda10780c3f586eb94e550c4aa61323965762fb992ff" != "sha256:9500c3c1b47ea960ca25773bca77d14085fe78761d3e7d70254376f715a2db12"
+helm.go:84: [debug] sha256 sum does not match for mychart-0.1.0.tgz: "sha256:fcf948c63332a66494feeda10780c3f586eb94e550c4aa61323965762fb992ff" != "sha256:9500c3c1b47ea960ca25773bca77d14085fe78761d3e7d70254376f715a2db12"
+...
+
+If you have not yet trusted the public key (i.e. the keyring provided does not contain the public key), you will be met with an error indicating this:
+
+$ helm install --debug --verify --keyring "${HOME}/.gnupg/mypubkeyring.gpg" prov-demo myrepo/mychart
+
+install.go:159: [debug] Original chart version: ""
+Error: openpgp: signature made by unknown entity
+helm.go:84: [debug] openpgp: signature made by unknown entity
+
+Or, if the signature is otherwise invalid, you will be met with a separate error:
+
+$ helm install --debug --verify --keyring "${HOME}/.gnupg/mypubkeyring.gpg" prov-demo myrepo/mychart
+
+install.go:159: [debug] Original chart version: ""
+Error: openpgp: invalid signature: RSA verification failure
+helm.go:84: [debug] openpgp: invalid signature: RSA verification failure
+
+Provenance files offer an extra layer of protection, allowing you to verify that chart packages have not been modified since they were released by the developer.
+
+
+An Alternate Approach to Chart Distribution
+While chart repositories offer a working, user-friendly approach to chart distribution, they also present some challenges, especially at scale. Here are a few notable issues with chart repositories that various people have experienced in the past:
+
+A repository’s index (index.yaml) can grow indefinitely in size, causing Helm to run out of memory in extreme cases when parsing the contents.
+No concept of multi-tenancy; you either get all the charts or none of the charts.
+No built-in support for token-based authentication and authorization.
+Identical charts at different locations are stored twice.
+Rather than attempting to address each of these issues on top of the existing chart repository system, the Helm developers decided to look outside of Helm for a solution. After some time, it became apparent that Helm should move towards a user experience similar to that of the Docker CLI (docker pull, docker push), which offers viable solutions for the majority of these problems.
+
+The evolution of the underlying API for the Docker CLI is now known as the Open Container Initiative (OCI) Distribution Specification. This specification is the basis for future efforts and improvements to Helm chart distribution. The latest details on this specification can be found at the project homepage.
+
+As of Helm 3.0, new experimental commands have been added to the Helm CLI to start leveraging OCI registries for chart distribution.
+
+Preview of OCI Commands
+Currently, Helm’s OCI support is still considered experimental. For that reason, it is not yet recommended to use these commands in a production setting.
+
+In order to start using these experimental features, you must first set a specific environment variable for Helm to recognize the commands:
+
+$ export HELM_EXPERIMENTAL_OCI=1
+
+You must also have a registry to work with. Many commercial registries do not yet support Helm charts. For testing purposes you can start a local version of Docker’s open source registry (Docker Distribution) in another terminal using Docker:
+
+$ docker run --rm -p 5000:5000 registry
+
+This will start an unauthenticated registry at localhost:5000. If you wish to further configure this registry, take a look at the Docker Documentation.
+
+With Helm’s OCI support comes a new chart cache, which stores charts in a content-addressable format (able to be located by digest). In order to save a chart in this cache, use the helm chart save command:
+
+$ helm create mychart
+
+Creating mychart
+
+$ helm chart save mychart localhost:5000/mychart
+
+ref:     localhost:5000/mychart:0.1.0
+digest:  7c0fb4e7f1997ac815494aea1d05d9215e609afc497559b7776a25a328b93dae
+size:    3.5 KiB
+name:    mychart
+version: 0.1.0
+0.1.0: saved
+
+Once you have charts in the cache, you can use helm chart list to view all of them:
+
+$ helm chart list
+
+REF                           NAME    VERSION DIGEST  SIZE    CREATED
+localhost:5000/mychart:0.1.0  mychart 0.1.0   8b53460 3.5 KiB 7 seconds
+
+Cont'd on the next page.
+
+Preview of OCI Commands (Cont.)
+To publish a chart to the registry, you can use helm chart push:
+
+$ helm chart push localhost:5000/mychart:0.1.0
+
+The push refers to repository [localhost:5000/mychart]
+ref:     localhost:5000/mychart:0.1.0
+digest:  8b5346012e09786a259c0347b10369316d9d8f8f856a05925375c9843792ba65
+size:    3.5 KiB
+name:    mychart
+version: 0.1.0
+0.1.0: pushed to remote (1 layer, 3.5 KiB total)
+
+Later on, other Helm clients can then download this chart using helm chart pull:
+
+$ helm chart pull localhost:5000/mychart:0.1.0
+
+0.1.0: Pulling from localhost:5000/mychart
+ref:     localhost:5000/mychart:0.1.0
+digest:  8b5346012e09786a259c0347b10369316d9d8f8f856a05925375c9843792ba65
+size:    3.5 KiB
+name:    mychart
+version: 0.1.0
+Status: Downloaded newer chart for localhost:5000/mychart:0.1.0
+
+There are also additional commands such as helm registry login and helm registry logout for managing authentication to the registry.
+
+If you have used Docker before, this user experience should feel familiar to you.
+
+Although these features are still considered experimental, many users have already provided positive feedback in favor of making OCI support a core part of Helm. As time goes on, it will become more apparent how Helm will adopt OCI. No doubt, this is definitely something to keep on your radar as it will have an effect on the overall Helm ecosystem.]]
+
+
+
